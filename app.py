@@ -94,12 +94,20 @@ GREETINGS = [
     "thank you", "bye", "goodbye"
 ]
 
+META_PATTERNS = [
+    "what do you mean", "what does that mean", "i don't understand", "i dont understand",
+    "can you clarify", "can you explain", "explain that", "what do u mean", "not clear"
+]
+
 def is_smalltalk(query):
-    """Catches greetings, thanks, and vague chatter that shouldn't hit the table QA engine.
-    TAPAS always returns *some* cell as an answer, even for nonsense input, so anything
-    that isn't clearly a grading question needs to be filtered out before it gets there."""
+    """Catches greetings, thanks, vague chatter, and meta-questions about a prior answer,
+    none of which should be routed to the table QA engine. TAPAS always returns *some*
+    cell as an answer even for nonsense input, so anything that isn't clearly a new
+    grading question needs to be filtered out before it gets there."""
     lowered = query.strip().lower()
     if not lowered:
+        return True
+    if any(p in lowered for p in META_PATTERNS):
         return True
     has_grading_keyword = any(k in lowered for k in GRADING_KEYWORDS)
     is_greeting = any(lowered == g or lowered.startswith(g) for g in GREETINGS)
@@ -110,6 +118,14 @@ def is_smalltalk(query):
 
 def smalltalk_response(query):
     lowered = query.strip().lower()
+    if any(p in lowered for p in META_PATTERNS):
+        last_answer = next(
+            (e["content"] for e in reversed(st.session_state.chat_history) if e["role"] == "assistant"),
+            None
+        )
+        if last_answer:
+            return f"To clarify my last answer: {last_answer} Let me know if you'd like it broken down differently."
+        return "I don't have a previous answer to clarify yet — what would you like to know about the class data?"
     if any(g in lowered for g in ["thanks", "thank you"]):
         return "You're welcome! Let me know if you'd like to check another student or metric."
     if any(g in lowered for g in ["bye", "goodbye"]):
@@ -168,9 +184,32 @@ def execute_table_qa(query):
             selected_rows = list(set([coord[0] for coord in coordinates]))
             st.session_state.active_subset = active_df.iloc[selected_rows].copy()
 
+        cells = result.get("cells", [])
+        aggregator = (result.get("aggregator") or "NONE").upper()
+
+        # TAPAS only labels which operator applies (SUM/AVERAGE/COUNT) — it doesn't
+        # compute the value itself. If it labeled numeric cells with an aggregator,
+        # do the actual math here instead of printing the raw "AVERAGE > ..." string.
+        if aggregator in ("SUM", "AVERAGE", "COUNT") and cells:
+            try:
+                numeric_cells = [float(c) for c in cells]
+            except ValueError:
+                numeric_cells = None
+
+            if numeric_cells:
+                if aggregator == "AVERAGE":
+                    value = sum(numeric_cells) / len(numeric_cells)
+                    return f"The average is {value:.1f} (based on {len(numeric_cells)} matching values)."
+                if aggregator == "SUM":
+                    return f"The total is {sum(numeric_cells):.1f}."
+                if aggregator == "COUNT":
+                    return f"There are {len(numeric_cells)} matching entries."
+            # Aggregator was mislabeled on non-numeric cells (e.g. names) — just list them
+            return ", ".join(cells)
+
         ans = result.get("answer", "")
-        if not ans and result.get("cells"):
-            ans = ", ".join(result["cells"])
+        if not ans and cells:
+            ans = ", ".join(cells)
         return ans if ans else "I couldn't find matching items."
     except Exception:
         return "Something went wrong querying the student data. Try rephrasing your question."
