@@ -83,8 +83,51 @@ def rewrite_query(current_query):
     outputs = rewriter_model.generate(**inputs, max_new_tokens=50, do_sample=False)
     return tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
+GRADING_KEYWORDS = [
+    "quiz", "assignment", "exam", "score", "grade", "grades", "student", "students",
+    "average", "pattern", "common", "missing", "submitted", "late", "cohort"
+]
+
+GREETINGS = [
+    "hi", "hello", "hey", "hola", "salam", "yo", "morning", "good morning",
+    "good afternoon", "good evening", "how are you", "what's up", "thanks",
+    "thank you", "bye", "goodbye"
+]
+
+def is_smalltalk(query):
+    """Catches greetings, thanks, and vague chatter that shouldn't hit the table QA engine.
+    TAPAS always returns *some* cell as an answer, even for nonsense input, so anything
+    that isn't clearly a grading question needs to be filtered out before it gets there."""
+    lowered = query.strip().lower()
+    if not lowered:
+        return True
+    has_grading_keyword = any(k in lowered for k in GRADING_KEYWORDS)
+    is_greeting = any(lowered == g or lowered.startswith(g) for g in GREETINGS)
+    has_digit = any(ch.isdigit() for ch in lowered)
+    # Short, keyword-free, digit-free input is treated as chit-chat rather than a data query
+    is_vague = len(lowered.split()) <= 5 and not has_grading_keyword and not has_digit
+    return is_greeting or is_vague
+
+def smalltalk_response(query):
+    lowered = query.strip().lower()
+    if any(g in lowered for g in ["thanks", "thank you"]):
+        return "You're welcome! Let me know if you'd like to check another student or metric."
+    if any(g in lowered for g in ["bye", "goodbye"]):
+        return "Goodbye! Come back anytime you need a grade breakdown."
+    return (
+        "Hi! I'm your grading assistant. Ask me things like "
+        "\"Which students scored below 60% on the final exam?\" or "
+        "\"What's the average Quiz 1 score?\" and I'll pull it from the class data. "
+        "(Right now I only understand questions written in English.)"
+    )
+
 def check_clarification_gate(query):
     lowered = query.lower()
+    # Map ordinal words to digits so "first quiz" is recognized the same as "Quiz 1"
+    ordinal_map = {"first": "1", "second": "2", "third": "3"}
+    for word, digit in ordinal_map.items():
+        if word in lowered:
+            lowered += f" {digit}"
     if "quiz" in lowered and not any(x in lowered for x in ["1", "2", "one", "two"]):
         return "Could you please specify if you mean Quiz 1 or Quiz 2?"
     if "assignment" in lowered and not any(x in lowered for x in ["1", "2", "3", "one", "two", "three", "average", "all"]):
@@ -113,8 +156,16 @@ def execute_table_qa(query):
     tapas_table = active_df.astype(str)
     try:
         result = table_qa_pipeline(table=tapas_table, query=query)
-        if result.get("coordinates") and not is_follow_up:
-            selected_rows = list(set([coord[0] for coord in result["coordinates"]]))
+        coordinates = result.get("coordinates") or []
+
+        if not coordinates:
+            return (
+                "I couldn't match that to a specific column or student in the data. "
+                "Try asking about a specific quiz, assignment, or exam score."
+            )
+
+        if not is_follow_up:
+            selected_rows = list(set([coord[0] for coord in coordinates]))
             st.session_state.active_subset = active_df.iloc[selected_rows].copy()
 
         ans = result.get("answer", "")
@@ -122,7 +173,7 @@ def execute_table_qa(query):
             ans = ", ".join(result["cells"])
         return ans if ans else "I couldn't find matching items."
     except Exception:
-        return "Error querying the table layout."
+        return "Something went wrong querying the student data. Try rephrasing your question."
 
 # --- APPLICATION UI LAYOUT ---
 
@@ -155,26 +206,30 @@ with col_chat:
         st.session_state.chat_history.append({"role": "user", "content": user_input})
 
         with st.spinner("Processing performance layers..."):
-            # 1. Check Guardrails
-            response = check_clarification_gate(user_input)
+            # 0. Filter out greetings/chit-chat before touching the data engine
+            if is_smalltalk(user_input):
+                response = smalltalk_response(user_input)
+            else:
+                # 1. Check Guardrails
+                response = check_clarification_gate(user_input)
 
-            if not response:
-                lowered_in = user_input.lower()
-                # 2. Logic Orchestration & Analytics Fallbacks
-                if "pattern" in lowered_in or "common" in lowered_in:
-                    insight = analyze_anomalies(st.session_state.active_subset)
-                    response = insight if insight else "No major overlapping behavioral anomalies caught in this group."
-                elif "average" in lowered_in and "assignment" in lowered_in:
-                    if st.session_state.active_subset is not None:
-                        a1_m = st.session_state.active_subset["Assignment_1_Score"].mean()
-                        a2_m = st.session_state.active_subset["Assignment_2_Score"].mean()
-                        response = f"The average assignment score for this group is {((a1_m + a2_m)/2):.1f}% (A1: {a1_m:.1f}%, A2: {a2_m:.1f}%)."
+                if not response:
+                    lowered_in = user_input.lower()
+                    # 2. Logic Orchestration & Analytics Fallbacks
+                    if "pattern" in lowered_in or "common" in lowered_in:
+                        insight = analyze_anomalies(st.session_state.active_subset)
+                        response = insight if insight else "No major overlapping behavioral anomalies caught in this group."
+                    elif "average" in lowered_in and "assignment" in lowered_in:
+                        if st.session_state.active_subset is not None:
+                            a1_m = st.session_state.active_subset["Assignment_1_Score"].mean()
+                            a2_m = st.session_state.active_subset["Assignment_2_Score"].mean()
+                            response = f"The average assignment score for this group is {((a1_m + a2_m)/2):.1f}% (A1: {a1_m:.1f}%, A2: {a2_m:.1f}%)."
+                        else:
+                            response = "Please isolate a student cohort first so I know whose averages to calculate."
                     else:
-                        response = "Please isolate a student cohort first so I know whose averages to calculate."
-                else:
-                    # 3. Handle via Query Rewriter and TAPAS
-                    rewritten = rewrite_query(user_input)
-                    response = execute_table_qa(rewritten)
+                        # 3. Handle via Query Rewriter and TAPAS
+                        rewritten = rewrite_query(user_input)
+                        response = execute_table_qa(rewritten)
 
         with st.chat_message("assistant"):
             st.write(response)
