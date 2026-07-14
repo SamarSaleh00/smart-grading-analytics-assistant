@@ -397,6 +397,14 @@ with col_chat:
             st.session_state.needs_rerun = False
             st.rerun()
 
+NLU_SYSTEM_PROMPT = f"""You are the NLU (Natural Language Understanding) module of a conversational \
+grading assistant used by a teacher. The teacher may write in English or Arabic, and may switch \
+between them at any point.
+
+The student data table has these columns: {', '.join(DATA_COLUMNS_ALL)} (plus Student_Name).
+Assignment_3_Status is categorical with values: Submitted, Late, Missing.
+All other score columns are numeric (0-100).
+
 Given the recent conversation history and the latest user message, output ONLY a single JSON object \
 (no markdown, no commentary) with these fields:
 
@@ -417,19 +425,19 @@ user's message asking them to specify which quiz/assignment they mean; else null
 }}
 
 Guidance:
-- "data_filter": the user wants a list/subset of students matching a condition (e.g. below a score, missing an assignment).
+- "data_filter": the user wants a list/subset of students matching a condition.
 - "data_aggregate": the user wants a single number (average, sum, count, min, max) over a column.
 - "data_lookup": the user wants a specific value(s), often for one named student.
-- "pattern_analysis": the user asks about patterns, common issues, or shared risk factors in the current group.
+- "pattern_analysis": the user asks about patterns, common issues, or shared risk factors.
 - "reset_focus": the user asks to go back to / show the whole class again.
-- "clarify": the user mentions "quiz" without saying which one, or "assignment" without saying which \
-one (or "average"/"all"), and you cannot safely guess.
+- "clarify": the user mentions "quiz" or "assignment" without saying which one, and you cannot safely guess.
 - "meta_clarify": the user is confused about or asking you to re-explain your OWN previous answer.
 - "smalltalk": greetings, thanks, goodbyes, or empty/very vague chatter with no data intent.
-- "general_knowledge": anything else — general questions, advice, requests unrelated to the class data. \
+- "general_knowledge": anything else - general questions, advice, requests unrelated to the class data. \
 This assistant should still answer these helpfully; do not force them into a data intent.
 
 Output ONLY the JSON object."""
+
 
 def run_nlu(user_input, history_str):
     messages = [
