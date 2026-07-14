@@ -83,7 +83,6 @@ def call_llm(messages, temperature=0.2, max_tokens=400, json_mode=False):
         resp = client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content
     except Exception as e:
-        # Prevent silent JSON parsing failure downstream
         return json.dumps({"error": str(e), "intent": "general_knowledge"}) if json_mode else f"(LLM error: {e})"
 
 def is_arabic(text):
@@ -104,6 +103,300 @@ The student data table has these columns: {', '.join(DATA_COLUMNS_ALL)} (plus St
 Assignment_3_Status is categorical: Submitted, Late, Missing.
 All other score columns are numeric (0-100).
 
+Given the history and latest message, output ONLY a single JSON object with these fields:
+{{
+  "language": "ar" or "en",
+  "intent": one of ["smalltalk", "clarify", "meta_clarify", "reset_focus", "data_filter",
+                     "data_aggregate", "data_lookup", "pattern_analysis", "general_knowledge"],
+  "standalone_query_en": "user's request rewritten in English as a self-contained question",
+  "column": "the single best-matching column name, or null",
+  "student_name": "specific student name, or null",
+  "filter_operator": one of "<", "<=", ">", ">=", "==", "!=" or null,
+  "filter_value": "comparison value as string, or null",
+  "aggregate_function": one of "mean", "sum", "count", "min", "max" or null,
+  "clarification_question": "short clarifying question IN THE SAME LANGUAGE, or null"
+}}
+
+Guidance:
+- "data_filter": the user wants a list/subset of students matching a condition.
+- "data_aggregate": the user wants a single number (average, sum, count, min, max) over a column.
+- "data_lookup": the user wants a specific value(s), often for one named student.
+- "pattern_analysis": the user asks about patterns, common issues, or shared risk factors.
+- "reset_focus": the user asks to go back to / show the whole class again.
+- "clarify": the user mentions "quiz" or "assignment" without saying which one.
+- "meta_clarify": the user asks you to re-explain your OWN previous answer.
+- "smalltalk": greetings, thanks, goodbyes, or empty/very vague chatter.
+- "general_knowledge": anything else - general questions, advice, requests unrelated to data.
+
+Output ONLY the JSON object."""
+
+def get_history_string():
+    history_str = ""
+    for entry in st.session_state.chat_history[-6:-1]:
+        prefix = "User" if entry["role"] == "user" else "Assistant"
+        history_str += f"{prefix}: {entry['content']}\n"
+    return history_str.strip()
+
+def run_nlu(user_input, history_str):
+    messages = [
+        {"role": "system", "content": NLU_SYSTEM_PROMPT},
+        {"role": "user", "content": f"Conversation history:\n{history_str or '(none)'}\n\nLatest user message:\n{user_input}"}
+    ]
+    raw = call_llm(messages, temperature=0.0, max_tokens=400, json_mode=True)
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        parsed = {}
+    
+    defaults = {
+        "language": "ar" if is_arabic(user_input) else "en",
+        "intent": "general_knowledge",
+        "standalone_query_en": user_input,
+        "column": None, "student_name": None,
+        "filter_operator": None, "filter_value": None,
+        "aggregate_function": None, "clarification_question": None,
+    }
+    defaults.update({k: v for k, v in parsed.items() if v is not None})
+    return defaults
+
+# =========================================================================
+# PHASE 4: RETRIEVAL ENGINE 
+# =========================================================================
+
+COMPARATORS = {
+    "<": operator.lt, "<=": operator.le, ">": operator.gt,
+    ">=": operator.ge, "==": operator.eq, "!=": operator.ne,
+}
+
+def filter_by_student(df, name):
+    if not name:
+        return df
+    return df[df["Student_Name"].str.lower() == str(name).strip().lower()]
+
+def apply_filter(df, column, op_str, value):
+    if column not in df.columns or value is None:
+        return None
+    if column == "Assignment_3_Status":
+        target = str(value).strip().lower()
+        mask = df[column].astype(str).str.lower() == target
+        if op_str == "!=":
+            mask = ~mask
+        return df[mask]
+    series = pd.to_numeric(df[column], errors="coerce")
+    try:
+        num_val = float(value)
+    except (TypeError, ValueError):
+        return None
+    op_func = COMPARATORS.get(op_str)
+    if op_func is None:
+        return None
+    return df[op_func(series, num_val)]
+
+def analyze_anomalies(subset):
+    if subset is None or subset.empty:
+        return None
+    missing_a3 = len(subset[subset["Assignment_3_Status"] == "Missing"])
+    total = len(subset)
+    if (missing_a3 / total) >= 0.30: 
+        pct = int((missing_a3 / total) * 100)
+        return f"{pct}% of this group is missing Assignment 3."
+    
+    avg_final = subset["Final_Exam_Score"].mean()
+    if avg_final < 65:
+        return f"The average Final Exam score for this group is remarkably low ({avg_final:.1f})."
+        
+    return "No obvious shared risk factors found in this specific group."
+
+def run_retrieval(nlu, active_df):
+    intent = nlu["intent"]
+    column = nlu.get("column")
+    student_name = nlu.get("student_name")
+
+    base_df = active_df
+    if student_name:
+        base_df = filter_by_student(active_df, student_name)
+        if base_df.empty:
+            return {"type": "error", "detail": f"No student named '{student_name}' found in the current focus group."}
+
+    if intent == "data_filter":
+        result_df = apply_filter(base_df, column, nlu.get("filter_operator"), nlu.get("filter_value"))
+        if result_df is None:
+            return {"type": "error", "detail": "Could not identify which column or value to filter on."}
+        return {"type": "filter", "df": result_df, "column": column}
+
+    if intent == "data_aggregate":
+        if column not in DATA_COLUMNS_NUMERIC:
+            return {"type": "error", "detail": "That column isn't numeric, so it can't be averaged/summed."}
+        series = pd.to_numeric(base_df[column], errors="coerce").dropna()
+        if series.empty:
+            return {"type": "error", "detail": "No numeric data available for that column in the current focus group."}
+        func = nlu.get("aggregate_function") or "mean"
+        value = getattr(series, func)()
+        return {"type": "aggregate", "value": value, "column": column, "func": func, "n": len(series)}
+
+    if intent == "data_lookup":
+        cols = ["Student_Name", column] if column in base_df.columns else base_df.columns.tolist()
+        return {"type": "lookup", "df": base_df[cols]}
+
+    return {"type": "none"}
+
+def summarize_retrieval(retrieval):
+    t = retrieval.get("type")
+    if t == "error":
+        return f"ERROR: {retrieval['detail']}"
+    if t == "aggregate":
+        return f"{retrieval['func']}({retrieval['column']}) = {retrieval['value']:.2f}  (based on {retrieval['n']} students)"
+    if t in ("filter", "lookup"):
+        df = retrieval["df"]
+        if df.empty:
+            return "No matching students found."
+        return df.to_csv(index=False)
+    if t == "pattern":
+        return retrieval["detail"]
+    return "No structured data result for this turn."
+
+# =========================================================================
+# PHASE 5: GENERATION 
+# =========================================================================
+
+def generate_grounded_response(user_query, language, retrieval):
+    grounding = summarize_retrieval(retrieval)
+    system = (
+        f"You are a warm, concise assistant helping a teacher review student grades. "
+        f"Reply ONLY in {lang_name(language)}. "
+        f"Use the ground-truth result below as the sole source of any numbers or names — "
+        f"never invent or alter a value. Keep it to 1-3 sentences unless listing several students. "
+        f"If the result starts with 'ERROR:', apologize briefly and suggest how to rephrase."
+    )
+    user_msg = f"Teacher's question: {user_query}\n\nGround-truth result:\n{grounding}"
+    return call_llm([{"role": "system", "content": system}, {"role": "user", "content": user_msg}], temperature=0.3)
+
+def generate_open_response(user_query, language):
+    system = f"You are a helpful, general-purpose assistant embedded inside a teacher's grading tool. Reply ONLY in {lang_name(language)}."
+    return call_llm([{"role": "system", "content": system}, {"role": "user", "content": user_query}], temperature=0.5)
+
+def generate_smalltalk(user_query, language):
+    system = (
+        f"You are a friendly grading assistant. The teacher just sent a greeting/small-talk message. "
+        f"Reply briefly and warmly in {lang_name(language)}, and remind them they can ask about grades or averages."
+    )
+    return call_llm([{"role": "system", "content": system}, {"role": "user", "content": user_query}], temperature=0.4, max_tokens=150)
+
+# =========================================================================
+# PHASE 6: DIALOGUE POLICY 
+# =========================================================================
+
+def handle_turn(user_input):
+    history_str = get_history_string()
+    nlu = run_nlu(user_input, history_str)
+    language = nlu.get("language") or ("ar" if is_arabic(user_input) else "en")
+    intent = nlu.get("intent")
+
+    if intent == "smalltalk":
+        return generate_smalltalk(user_input, language)
+
+    if intent == "clarify":
+        return nlu.get("clarification_question") or (
+            "من فضلك وضّح أكثر." if language == "ar" else "Could you clarify that a bit more?"
+        )
+
+    if intent == "meta_clarify":
+        last = next((e["content"] for e in reversed(st.session_state.chat_history) if e["role"] == "assistant"), None)
+        if not last:
+            return "لا توجد إجابة سابقة لأوضحها بعد." if language == "ar" else "I don't have a previous answer to clarify yet."
+        system = f"Rephrase the following previous answer more simply and clearly, in {lang_name(language)}."
+        return call_llm([{"role": "system", "content": system}, {"role": "user", "content": last}], temperature=0.3)
+
+    if intent == "reset_focus":
+        st.session_state.active_subset = None
+        st.session_state.needs_rerun = True  
+        return "تم إعادة التركيز إلى الصف بالكامل." if language == "ar" else "Focus reset to the entire class."
+
+    if intent == "general_knowledge":
+        return generate_open_response(nlu.get("standalone_query_en", user_input), language)
+
+    active_df = st.session_state.active_subset if st.session_state.active_subset is not None else st.session_state.df
+
+    if intent == "pattern_analysis":
+        insight = analyze_anomalies(active_df)
+        retrieval = {"type": "pattern", "detail": insight}
+        return generate_grounded_response(user_input, language, retrieval)
+
+    retrieval = run_retrieval(nlu, active_df)
+
+    if retrieval["type"] == "filter":
+        st.session_state.active_subset = retrieval["df"].copy()
+        st.session_state.needs_rerun = True  
+
+    return generate_grounded_response(user_input, language, retrieval)
+
+# =========================================================================
+# APPLICATION STATE + UI
+# =========================================================================
+
+if "df" not in st.session_state:
+    st.session_state.df = ensure_synthetic_data()
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "active_subset" not in st.session_state:
+    st.session_state.active_subset = None
+if "needs_rerun" not in st.session_state:
+    st.session_state.needs_rerun = False
+
+col_dash, col_chat = st.columns([1, 1.2])
+
+with col_dash:
+    st.header("📊 Live Student Analytics")
+    if st.session_state.active_subset is not None:
+        st.subheader("🎯 Isolated Focus Cohort")
+        st.dataframe(st.session_state.active_subset, use_container_width=True)
+        if st.button("Reset Data Focus to Entire Class"):
+            st.session_state.active_subset = None
+            st.rerun()
+    else:
+        st.subheader("🏫 Full Class Database")
+        st.dataframe(st.session_state.df, use_container_width=True)
+
+with col_chat:
+    st.header("🤖 Conversational Assistant / المساعد التحاوري")
+
+    # Render Chat History
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            safe_text = html.escape(msg["content"])
+            if is_arabic(msg["content"]):
+                st.markdown(f'<div dir="rtl" style="text-align:right">{safe_text}</div>', unsafe_allow_html=True)
+            else:
+                st.write(msg["content"])
+
+    # Chat Input 
+    placeholder = "Ask about grades, averages, patterns — in English or Arabic..."
+    if user_input := st.chat_input(placeholder):
+        
+        with st.chat_message("user"):
+            safe_user_text = html.escape(user_input)
+            if is_arabic(user_input):
+                st.markdown(f'<div dir="rtl" style="text-align:right">{safe_user_text}</div>', unsafe_allow_html=True)
+            else:
+                st.write(user_input)
+        
+        st.session_state.chat_history.append({"role": "user", "content": user_input})
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking… / لحظة من فضلك..."):
+                response = handle_turn(user_input)
+                
+            safe_resp_text = html.escape(response)
+            if is_arabic(response):
+                st.markdown(f'<div dir="rtl" style="text-align:right">{safe_resp_text}</div>', unsafe_allow_html=True)
+            else:
+                st.write(response)
+                
+        st.session_state.chat_history.append({"role": "assistant", "content": response})
+
+        if st.session_state.needs_rerun:
+            st.session_state.needs_rerun = False
+            st.rerun()
 Given the history and latest message, output ONLY a single JSON object with these fields:
 {{
   "language": "ar" or "en",
